@@ -27,7 +27,7 @@ def test():
     i =0
     while i<10:
         print(f"Attidue (yaw, pitch, roll): {cam.getAttitude()}")
-        sleep(0.5)
+        sleep(0.05)
         i += 1
 
     print('DONE')

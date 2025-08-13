@@ -1,0 +1,216 @@
+version: '3.8'
+
+services:
+  # SIYI SDK Core Service
+  siyi-sdk:
+    build:
+      context: .
+      target: production
+    container_name: siyi-sdk
+    restart: unless-stopped
+    environment:
+      - SIYI_CAMERA_IP=${SIYI_CAMERA_IP:-192.168.144.25}
+      - SIYI_CAMERA_PORT=${SIYI_CAMERA_PORT:-37260}
+      - SIYI_CAMERA_DEBUG=${SIYI_CAMERA_DEBUG:-false}
+    ports:
+      - "37260:37260/udp"
+      - "37260:37260/tcp"
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+    networks:
+      - siyi-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).connect(('127.0.0.1', 37260))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # SIYI SDK with Streaming Support
+  siyi-streaming:
+    build:
+      context: .
+      target: streaming
+    container_name: siyi-streaming
+    restart: unless-stopped
+    environment:
+      - SIYI_CAMERA_IP=${SIYI_CAMERA_IP:-192.168.144.25}
+      - SIYI_CAMERA_PORT=${SIYI_CAMERA_PORT:-37260}
+      - SIYI_RTSP_URL=${SIYI_RTSP_URL:-rtsp://192.168.144.25:8554/main.264}
+    ports:
+      - "8554:8554"
+      - "1935:1935"
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - ./recordings:/app/recordings
+    networks:
+      - siyi-network
+    depends_on:
+      - nginx-rtmp
+    profiles:
+      - streaming
+
+  # SIYI SDK with GUI Support
+  siyi-gui:
+    build:
+      context: .
+      target: gui
+    container_name: siyi-gui
+    restart: unless-stopped
+    environment:
+      - SIYI_CAMERA_IP=${SIYI_CAMERA_IP:-192.168.144.25}
+      - SIYI_CAMERA_PORT=${SIYI_CAMERA_PORT:-37260}
+      - DISPLAY=${DISPLAY:-:0}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    networks:
+      - siyi-network
+    profiles:
+      - gui
+
+  # Development Environment
+  siyi-dev:
+    build:
+      context: .
+      target: development
+    container_name: siyi-dev
+    restart: unless-stopped
+    environment:
+      - SIYI_CAMERA_IP=${SIYI_CAMERA_IP:-192.168.144.25}
+      - SIYI_CAMERA_PORT=${SIYI_CAMERA_PORT:-37260}
+      - SIYI_CAMERA_DEBUG=${SIYI_CAMERA_DEBUG:-true}
+    ports:
+      - "37260:37260/udp"
+      - "37260:37260/tcp"
+      - "8000:8000"  # For development server
+    volumes:
+      - .:/app
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+    networks:
+      - siyi-network
+    profiles:
+      - dev
+
+  # NGINX RTMP Server for Streaming
+  nginx-rtmp:
+    image: tiangolo/nginx-rtmp:latest
+    container_name: nginx-rtmp
+    restart: unless-stopped
+    ports:
+      - "1935:1935"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./recordings:/recordings
+    networks:
+      - siyi-network
+    profiles:
+      - streaming
+
+  # Redis for Caching and State Management
+  redis:
+    image: redis:7-alpine
+    container_name: siyi-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - siyi-network
+    profiles:
+      - streaming
+
+  # PostgreSQL for Data Storage
+  postgres:
+    image: postgres:15-alpine
+    container_name: siyi-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=siyi_sdk
+      - POSTGRES_USER=siyi_user
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-siyi_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - siyi-network
+    profiles:
+      - streaming
+
+  # Prometheus for Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: siyi-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - siyi-network
+    profiles:
+      - monitoring
+
+  # Grafana for Visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: siyi-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana:/etc/grafana/provisioning:ro
+    networks:
+      - siyi-network
+    profiles:
+      - monitoring
+
+  # Jupyter Notebook for Development
+  jupyter:
+    image: jupyter/datascience-notebook:latest
+    container_name: siyi-jupyter
+    restart: unless-stopped
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-siyi_sdk}
+    ports:
+      - "8888:8888"
+    volumes:
+      - .:/home/jovyan/work
+      - ./notebooks:/home/jovyan/work/notebooks
+    networks:
+      - siyi-network
+    profiles:
+      - dev
+
+volumes:
+  redis_data:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  siyi-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Default profile runs only core services
+# Use --profile streaming for streaming services
+# Use --profile gui for GUI services  
+# Use --profile dev for development services
+# Use --profile monitoring for monitoring services 

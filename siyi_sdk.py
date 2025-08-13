@@ -6,28 +6,61 @@ Email: mohamedashraf123@gmail.com
 Copyright 2022
 
 """
+from __future__ import annotations
 import socket
 from siyi_message import *
 from time import sleep, time
 import logging
-from utils import  toInt
+from utils import toInt
 import threading
 import cameras
+from typing import Optional, Dict, Any, Tuple, Union
+from dataclasses import dataclass
+import os
+from contextlib import contextmanager
+
+
+@dataclass
+class CameraConfig:
+    """Configuration class for camera settings"""
+    server_ip: str = "192.168.144.25"
+    port: int = 37260
+    debug: bool = False
+    connection_timeout: float = 5.0
+    max_retries: int = 3
+    heartbeat_interval: float = 1.0
+    gimbal_info_interval: float = 1.0
+    gimbal_attitude_interval: float = 0.02
 
 
 class SIYISDK:
-    def __init__(self, server_ip="192.168.144.25", port=37260, debug=False):
+    def __init__(self, config: Optional[CameraConfig] = None, **kwargs):
         """
-        Params
-        --
-        - server_ip [str] IP address of the camera
-        - port: [int] UDP port of the camera
+        Initialize SIYI SDK with configuration
+        
+        Args:
+            config: CameraConfig object with all settings
+            **kwargs: Override specific config values
         """
-        self._debug = debug
+        # Load configuration from environment variables or use defaults
+        self._config = config or CameraConfig()
+        
+        # Override with kwargs if provided
+        for key, value in kwargs.items():
+            if hasattr(self._config, key):
+                setattr(self._config, key, value)
+        
+        # Override with environment variables
+        self._config.server_ip = os.getenv('SIYI_CAMERA_IP', self._config.server_ip)
+        self._config.port = int(os.getenv('SIYI_CAMERA_PORT', str(self._config.port)))
+        self._config.debug = os.getenv('SIYI_CAMERA_DEBUG', 'false').lower() == 'true'
+        
+        self._debug = self._config.debug
         if self._debug:
             d_level = logging.DEBUG
         else:
             d_level = logging.INFO
+            
         LOG_FORMAT = ' [%(levelname)s] %(asctime)s [SIYISDK::%(funcName)s] :\t%(message)s'
         logging.basicConfig(format=LOG_FORMAT, level=d_level)
         self._logger = logging.getLogger(self.__class__.__name__)
@@ -38,36 +71,55 @@ class SIYISDK:
         # Message received from the camera
         self._in_msg = SIYIMESSAGE(debug=self._debug)        
 
-        self._server_ip = server_ip
-        self._port = port
+        self._server_ip = self._config.server_ip
+        self._port = self._config.port
 
         self._BUFF_SIZE = 1024
 
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._rcv_wait_t = 5  # Receiving wait time
-        self._socket.settimeout(self._rcv_wait_t)
+        self._socket: Optional[socket.socket] = None
+        self._rcv_wait_t = self._config.connection_timeout
+        self._max_retries = self._config.max_retries
 
         self.resetVars()
 
         # Stop threads flag
         self._stop = False  
         
-        self._recv_thread = threading.Thread(target=self.recvLoop)
+        self._recv_thread: Optional[threading.Thread] = None
 
         # Connection thread
         self._last_fw_seq = 0  # used to check on connection liveness
-        self._conn_loop_rate = 1  # seconds
-        self._conn_thread = threading.Thread(target=self.connectionLoop, args=(self._conn_loop_rate,))
+        self._conn_loop_rate = self._config.heartbeat_interval
+        self._conn_thread: Optional[threading.Thread] = None
 
         # Gimbal info thread @ 1Hz
-        self._gimbal_info_loop_rate = 1
-        self._g_info_thread = threading.Thread(target=self.gimbalInfoLoop, args=(self._gimbal_info_loop_rate,))
+        self._gimbal_info_loop_rate = self._config.gimbal_info_interval
+        self._g_info_thread: Optional[threading.Thread] = None
 
-        # Gimbal attitude thread @ 10Hz
-        self._gimbal_att_loop_rate = 0.02
-        self._g_att_thread = threading.Thread(target=self.gimbalAttLoop, args=(self._gimbal_att_loop_rate,))
+        # Gimbal attitude thread @ 50Hz
+        self._gimbal_att_loop_rate = self._config.gimbal_attitude_interval
+        self._g_att_thread: Optional[threading.Thread] = None
 
-    def resetVars(self):
+    def __enter__(self) -> 'SIYISDK':
+        """Context manager entry point"""
+        if not self.connect():
+            raise ConnectionError(f"Failed to connect to camera at {self._server_ip}:{self._port}")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Context manager exit point"""
+        self.disconnect()
+
+    @contextmanager
+    def safe_operation(self, operation_name: str):
+        """Context manager for safe operations with error handling"""
+        try:
+            yield
+        except Exception as e:
+            self._logger.error(f"Operation '{operation_name}' failed: {e}")
+            raise
+
+    def resetVars(self) -> None:
         """
         Resets variables to their initial values.
         """
@@ -90,111 +142,150 @@ class SIYISDK:
         self._current_zoom_level_msg = CurrentZoomValueMsg()
         self._last_att_seq = -1
 
-        return True
-
-    def connect(self, maxWaitTime=3.0, maxRetries=3):
+    def connect(self, maxWaitTime: Optional[float] = None, maxRetries: Optional[int] = None) -> bool:
         """
         Attempts to connect to the camera with retries if needed.
         
-        Params
-        --
-        - maxWaitTime [float]: Maximum time to wait before giving up on connection (in seconds)
-        - maxRetries [int]: Number of times to retry connecting if it fails
+        Args:
+            maxWaitTime: Maximum time to wait for connection (overrides config)
+            maxRetries: Maximum number of retry attempts (overrides config)
+            
+        Returns:
+            bool: True if connection successful, False otherwise
         """
-        retries = 0
-        while retries < maxRetries:
+        maxWaitTime = maxWaitTime or self._config.connection_timeout
+        maxRetries = maxRetries or self._config.max_retries
+        
+        for attempt in range(maxRetries):
             try:
-                # Initialize fresh thread instances for each connection attempt
-                self._recv_thread = threading.Thread(target=self.recvLoop)
-                self._conn_thread = threading.Thread(target=self.connectionLoop, args=(self._conn_loop_rate,))
-                self._g_info_thread = threading.Thread(target=self.gimbalInfoLoop, args=(self._gimbal_info_loop_rate,))
-                self._g_att_thread = threading.Thread(target=self.gimbalAttLoop, args=(self._gimbal_att_loop_rate,))
+                self._logger.info(f"Connection attempt {attempt + 1}/{maxRetries} to {self._server_ip}:{self._port}")
                 
-                self._logger.info(f"Attempting to connect to camera, attempt {retries + 1}")
-                self._recv_thread.start()
-                self._conn_thread.start()
-                t0 = time()
+                if self._socket is None:
+                    self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    self._socket.settimeout(self._rcv_wait_t)
 
-                while True:
-                    if self._connected:
-                        self._logger.info(f"Successfully connected to camera on attempt {retries + 1}")
-                        self._g_info_thread.start()
-                        self._g_att_thread.start()
-
-                        self.requestHardwareID()
-                        sleep(0.2)
-                        # self.requestDataStreamAttitude(50) # Not working 12 Sept 2024!
-                        # sleep(0.5)
-                        self.requestCurrentZoomLevel()
-                        sleep(0.2)
-                        return True
-
-                    if (time() - t0) > maxWaitTime and not self._connected:
-                        self._logger.error("Failed to connect to camera, retrying...")
-                        self.disconnect()
-                        retries += 1
-                        break
-
+                # Test connection by sending a simple message
+                if self._test_connection():
+                    self._start_threads()
+                    self._logger.info("Successfully connected to camera")
+                    return True
+                    
             except Exception as e:
-                self._logger.error(f"Connection attempt {retries + 1} failed: {e}")
-                self.disconnect()
-                retries += 1
-
-        self._logger.error(f"Failed to connect after {maxRetries} retries")
+                self._logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+                if attempt < maxRetries - 1:
+                    sleep_time = min(2 ** attempt, 10)  # Exponential backoff
+                    self._logger.info(f"Retrying in {sleep_time} seconds...")
+                    sleep(sleep_time)
+                else:
+                    self._logger.error("All connection attempts failed")
+                    
         return False
 
-    def disconnect(self):
-        """
-        Gracefully stops all threads, disconnects, and cleans up resources.
-        """
-        self._logger.info("Stopping all threads and disconnecting")
-        self._stop = True  # Signal threads to stop
+    def _test_connection(self) -> bool:
+        """Test if the connection is working by sending a simple message"""
+        try:
+            # Try to get firmware version as a connection test
+            self._send_message(self._out_msg.getFirmwareVersion())
+            return True
+        except Exception as e:
+            self._logger.debug(f"Connection test failed: {e}")
+            return False
 
-        # Close the socket to unblock any recvfrom() calls
+    def _start_threads(self) -> None:
+        """Start all background threads"""
+        if self._recv_thread is None or not self._recv_thread.is_alive():
+            self._recv_thread = threading.Thread(target=self.recvLoop, daemon=True)
+            self._recv_thread.start()
+
+        if self._conn_thread is None or not self._conn_thread.is_alive():
+            self._conn_thread = threading.Thread(target=self.connectionLoop, args=(self._conn_loop_rate,), daemon=True)
+            self._conn_thread.start()
+
+        if self._g_info_thread is None or not self._g_info_thread.is_alive():
+            self._g_info_thread = threading.Thread(target=self.gimbalInfoLoop, args=(self._gimbal_info_loop_rate,), daemon=True)
+            self._g_info_thread.start()
+
+        if self._g_att_thread is None or not self._g_att_thread.is_alive():
+            self._g_att_thread = threading.Thread(target=self.gimbalAttLoop, args=(self._gimbal_att_loop_rate,), daemon=True)
+            self._g_att_thread.start()
+
+    def disconnect(self) -> None:
+        """
+        Disconnects from the camera and cleans up resources.
+        """
+        self._logger.info("Disconnecting from camera...")
+        self._stop = True
+        
+        # Wait for threads to finish
+        for thread_name, thread in [("recv", self._recv_thread), ("conn", self._conn_thread), 
+                                  ("g_info", self._g_info_thread), ("g_att", self._g_att_thread)]:
+            if thread and thread.is_alive():
+                self._logger.debug(f"Waiting for {thread_name} thread to finish...")
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    self._logger.warning(f"{thread_name} thread did not finish gracefully")
+        
+        # Close socket
         if self._socket:
             try:
                 self._socket.close()
             except Exception as e:
-                self._logger.error(f"Error closing socket: {e}")
+                self._logger.warning(f"Error closing socket: {e}")
+            finally:
+                self._socket = None
+        
+        self._connected = False
+        self._logger.info("Disconnected from camera")
 
-        # Wait for threads to finish, if they're still alive
-        if self._recv_thread.is_alive():
-            self._recv_thread.join()
-        if self._conn_thread.is_alive():
-            self._conn_thread.join()
-        if self._g_info_thread.is_alive():
-            self._g_info_thread.join()
-        if self._g_att_thread.is_alive():
-            self._g_att_thread.join()
+    def _send_message(self, message: bytes) -> None:
+        """Send a message to the camera with error handling"""
+        if not self._socket:
+            raise ConnectionError("Socket not initialized")
+        
+        try:
+            self._socket.sendto(message, (self._server_ip, self._port))
+        except Exception as e:
+            self._logger.error(f"Failed to send message: {e}")
+            raise
 
-        # Reset the stop flag and other variables
-        self.resetVars()
-        self._stop = False
+    def is_connected(self) -> bool:
+        """Check if the camera is currently connected"""
+        return self._connected and self._socket is not None
 
-    def checkConnection(self):
+    def get_connection_info(self) -> Dict[str, Any]:
+        """Get current connection information"""
+        return {
+            'connected': self._connected,
+            'server_ip': self._server_ip,
+            'port': self._port,
+            'socket_active': self._socket is not None,
+            'last_fw_seq': self._last_fw_seq
+        }
+
+    def checkConnection(self) -> None:
         """
         Checks if there is a live connection to the camera by requesting the Firmware version.
         Runs in a thread at a defined frequency.
         """
         try:
-            self.requestFirmwareVersion()
-            sleep(0.1)
-            if self._fw_msg.seq != self._last_fw_seq and len(self._fw_msg.gimbal_firmware_ver) > 0:
-                self._connected = True
-                self._last_fw_seq = self._fw_msg.seq
-            else:
-                self._connected = False
+            with self.safe_operation("connection check"):
+                self.requestFirmwareVersion()
+                sleep(0.1)
+                if self._fw_msg.seq != self._last_fw_seq and len(self._fw_msg.gimbal_firmware_ver) > 0:
+                    self._connected = True
+                    self._last_fw_seq = self._fw_msg.seq
+                else:
+                    self._connected = False
         except Exception as e:
             self._logger.error(f"Connection check failed: {e}")
-            self.disconnect()
+            self._connected = False
 
-    def connectionLoop(self, t):
+    def connectionLoop(self, t: float) -> None:
         """
         Periodically checks connection status and resets state if disconnected.
 
-        Params
-        --
-        - t [float]: message frequency in seconds
+        Args:
+            t: message frequency in seconds
         """
         while not self._stop:
             try:
@@ -202,7 +293,7 @@ class SIYISDK:
                 sleep(t)
             except Exception as e:
                 self._logger.error(f"Error in connection loop: {e}")
-                self.disconnect()
+                self._connected = False
                 break
 
     # def recvLoop(self):
@@ -230,78 +321,109 @@ class SIYISDK:
     #     finally:
     #         self._logger.info("Exiting recvLoop")
 
-    def isConnected(self):
+    def isConnected(self) -> bool:
+        """Check if the camera is currently connected (deprecated, use is_connected())"""
         return self._connected
 
-    def gimbalInfoLoop(self, t):
+    def gimbalInfoLoop(self, t: float) -> None:
         """
         Periodically requests gimbal info.
 
-        Params
-        --
-        - t [float]: message frequency in seconds
+        Args:
+            t: message frequency in seconds
         """
         while not self._stop:
             try:
-                self.requestGimbalInfo()
+                with self.safe_operation("gimbal info request"):
+                    self.requestGimbalInfo()
                 sleep(t)
             except Exception as e:
                 self._logger.error(f"Error in gimbal info loop: {e}")
-                self.disconnect()
+                break
 
-    def gimbalAttLoop(self, t):
+    def gimbalAttLoop(self, t: float) -> None:
         """
         Periodically requests gimbal attitude.
 
-        Params
-        --
-        - t [float]: message frequency in seconds
+        Args:
+            t: message frequency in seconds
         """
         while not self._stop:
             try:
-                self.requestGimbalAttitude()
+                with self.safe_operation("gimbal attitude request"):
+                    self.requestGimbalAttitude()
                 sleep(t)
             except Exception as e:
                 self._logger.error(f"Error in gimbal attitude loop: {e}")
-                self.disconnect()
+                break
 
-    def sendMsg(self, msg):
+    def sendMsg(self, msg: str) -> bool:
         """
         Sends a message to the camera
 
-        Params
-        --
-        msg [str] Message to send
+        Args:
+            msg: Message to send in hex format
+
+        Returns:
+            bool: True if message sent successfully, False otherwise
         """
-        b = bytes.fromhex(msg)
+        if not self.is_connected():
+            self._logger.error("Cannot send message: not connected")
+            return False
+            
         try:
-            self._socket.sendto(b, (self._server_ip, self._port))
+            b = bytes.fromhex(msg)
+            self._send_message(b)
             return True
         except Exception as e:
-            self._logger.error("Could not send bytes")
+            self._logger.error(f"Could not send bytes: {e}")
             return False
 
-    def rcvMsg(self):
-        data=None
+    def rcvMsg(self) -> Optional[bytes]:
+        """
+        Receives a message from the camera
+        
+        Returns:
+            Optional[bytes]: Received data or None if no data received
+        """
+        if not self.is_connected():
+            self._logger.error("Cannot receive message: not connected")
+            return None
+            
         try:
-            data,addr = self._socket.recvfrom(self._BUFF_SIZE)
+            data, addr = self._socket.recvfrom(self._BUFF_SIZE)
+            return data
+        except socket.timeout:
+            self._logger.debug("No message received within timeout")
+            return None
         except Exception as e:
-            self._logger.warning("%s. Did not receive message within %s second(s)", e, self._rcv_wait_t)
-        return data
+            self._logger.warning(f"Error receiving message: {e}")
+            return None
 
-    def recvLoop(self):
+    def recvLoop(self) -> None:
+        """Continuously receives data from the camera in a separate thread"""
         self._logger.debug("Started data receiving thread")
-        while( not self._stop):
-            self.bufferCallback()
+        while not self._stop:
+            try:
+                self.bufferCallback()
+            except Exception as e:
+                self._logger.error(f"Error in receive loop: {e}")
+                if not self._stop:
+                    sleep(0.1)  # Brief pause before retrying
         self._logger.debug("Exiting data receiving thread")
 
     
-    def bufferCallback(self):
+    def bufferCallback(self) -> None:
         """
         Receives messages and parses its content
         """
+        if not self.is_connected():
+            return
+            
         try:
-            buff,addr = self._socket.recvfrom(self._BUFF_SIZE)
+            buff, addr = self._socket.recvfrom(self._BUFF_SIZE)
+        except socket.timeout:
+            return  # Timeout is expected, not an error
         except Exception as e:
             self._logger.error(f"[bufferCallback] {e}")
             return
@@ -380,57 +502,61 @@ class SIYISDK:
     ##################################################
     #               Request functions                #
     ##################################################    
-    def requestFirmwareVersion(self):
+    def requestFirmwareVersion(self) -> bool:
         """
         Sends request for firmware version
 
-        Returns
-        --
-        [bool] True: success. False: fail
+        Returns:
+            bool: True if request sent successfully, False otherwise
         """
-        msg = self._out_msg.firmwareVerMsg()
-        if not self.sendMsg(msg):
+        if not self.is_connected():
+            self._logger.error("Cannot request firmware version: not connected")
             return False
-        return True
+            
+        msg = self._out_msg.firmwareVerMsg()
+        return self.sendMsg(msg)
 
-    def requestHardwareID(self):
+    def requestHardwareID(self) -> bool:
         """
         Sends request for Hardware ID
 
-        Returns
-        --
-        [bool] True: success. False: fail
+        Returns:
+            bool: True if request sent successfully, False otherwise
         """
-        msg = self._out_msg.hwIdMsg()
-        if not self.sendMsg(msg):
+        if not self.is_connected():
+            self._logger.error("Cannot request hardware ID: not connected")
             return False
-        return True
+            
+        msg = self._out_msg.hwIdMsg()
+        return self.sendMsg(msg)
 
-    def requestGimbalAttitude(self):
+    def requestGimbalAttitude(self) -> bool:
         """
         Sends request for gimbal attitude
 
-        Returns
-        --
-        [bool] True: success. False: fail
+        Returns:
+            bool: True if request sent successfully, False otherwise
         """
-        msg = self._out_msg.gimbalAttMsg()
-        if not self.sendMsg(msg):
+        if not self.is_connected():
+            self._logger.error("Cannot request gimbal attitude: not connected")
             return False
-        return True
+            
+        msg = self._out_msg.gimbalAttMsg()
+        return self.sendMsg(msg)
 
-    def requestGimbalInfo(self):
+    def requestGimbalInfo(self) -> bool:
         """
         Sends request for gimbal information
 
-        Returns
-        --
-        [bool] True: success. False: fail
+        Returns:
+            bool: True if request sent successfully, False otherwise
         """
-        msg = self._out_msg.gimbalInfoMsg()
-        if not self.sendMsg(msg):
+        if not self.is_connected():
+            self._logger.error("Cannot request gimbal info: not connected")
             return False
-        return True
+            
+        msg = self._out_msg.gimbalInfoMsg()
+        return self.sendMsg(msg)
 
     def requestFunctionFeedback(self):
         """
